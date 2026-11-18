@@ -15,10 +15,11 @@ GitHub Actionsワークフローを使用して、Internet Archiveからファ�
 ### プロセス3: ダウンロード
 - Internet Archive URLからファイルをダウンロード
 - サポートする形式:
-  - archive.org/details/xxx (詳細ページ)
-  - 直接ファイルURL (.zip, .7z, .tar, .gz, .exe, .iso など)
-  - 一般的なURL
+  - `archive.org/details/identifier` (詳細ページ) - **推奨**
+  - 直接ファイルURL (`.zip`, `.7z`, `.tar`, `.gz`, `.exe`, `.iso` など)
+  - 一般的なURL (自動で解析を試みます)
 - 圧縮ファイルを自動展開
+- **重要**: 2KBのHTMLファイルを自動的にフィルタリングし、削除します
 
 ### プロセス4: フォルダ構造の処理
 - GitHub Releaseではフォルダのアップロードが出来ないため
@@ -59,17 +60,59 @@ GitHub Actionsワークフローを使用して、Internet Archiveからファ�
    - `release_tag`: リリースタグ (任意)
 5. **Run workflow** をクリック
 
-### 例: Internet Archiveからダウンロード
+### 例
 
+#### Internet Archive詳細ページからダウンロード (推奨)
 ```
 archive_url: https://archive.org/details/msdos_Emperor_of_the_Fading_Suns_1996
 ```
 
-### 例: 直接ファイルをダウンロード
-
+#### 直接ファイルをダウンロード
 ```
 archive_url: https://archive.org/download/some-file.zip/some-file.zip
 ```
+
+#### 一般的なURL
+```
+archive_url: https://archive.org/any/page
+```
+
+## トラブルシューティング
+
+### 2KBのHTMLファイルがダウンロードされる
+**原因**: Internet ArchiveのAPIが失敗した場合、wgetがHTMLページをダウンロードしてしまいます。
+
+**解決**: 
+- 正しいInternet Archiveの詳細ページURL (`https://archive.org/details/identifier`) を使用してください
+- 直接ファイルURLを使用する場合は、拡張子を含む完全なURLを指定してください
+- ワークフローは自動的に2KB以下のHTMLファイルをフィルタリングします
+
+### APIからファイルが見つからない
+**原因**: 
+- Identifierが間違っている
+- アーカイブが非公開または削除されている
+- APIのレスポンス形式が変更された
+
+**解決**:
+- URLを確認してください
+- ブラウザでURLにアクセスし、ファイルが存在することを確認してください
+- 直接ファイルURLを使用してください
+
+### ダウンロードが遅い
+**原因**: 大容量ファイルのダウンロードには時間がかかります
+
+**解決**:
+- 小さいファイルからテストしてください
+- GitHub Actionsのタイムアウトは6時間です
+
+### ファイルが分割されない
+**原因**: 
+- ファイルサイズが1.9GB以下
+- 分割ツールのエラー
+
+**解決**:
+- `du -h filename` でファイルサイズを確認してください
+- 1.9GB以上のファイルは自動的に分割されます
 
 ## 制限事項
 
@@ -77,6 +120,8 @@ archive_url: https://archive.org/download/some-file.zip/some-file.zip
 - 1.9GB以上のファイルは自動的に分割されます
 - 分割されたファイルは `.z01`, `.z02` などの拡張子で保存されます
 - 7z形式で分割された場合は `.7z.001`, `.7z.002` など
+- GitHub Actionsの実行時間制限: 6時間
+- GitHub Releaseのストレージ制限: 2GB以下のファイルのみ
 
 ## 必要条件
 
@@ -84,21 +129,12 @@ archive_url: https://archive.org/download/some-file.zip/some-file.zip
 - `contents: write` パーミッションが自動的に付与されます
 - GitHub Actionsの実行環境 (ubuntu-latest)
 
-## トラブルシューティング
+## テスト
 
-### ダウンロードに失敗する
-- URLが正しいことを確認してください
-- Internet ArchiveのURL形式を確認してください
-- 直接ファイルURLの場合、拡張子を確認してください
-
-### ファイルが分割されない
-- ファイルサイズが正確に計算されていることを確認
-- `du -h filename` コマンドでサイズを確認
-
-### アップロードに失敗する
-- GitHub Tokenの権限を確認
-- ファイル名に無効な文字が含まれていないか確認
-- 2.0GB以上のファイルが含まれていないか確認
+小さいファイルでテストすることをお勧めします:
+```
+archive_url: https://archive.org/details/test-file-123
+```
 
 ## ライセンス
 
