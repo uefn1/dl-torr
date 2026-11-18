@@ -1,0 +1,302 @@
+name: Download from Internet Archive and Upload to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      archive_url:
+        description: 'Internet Archive URL to download'
+        required: true
+        type: string
+      release_name:
+        description: 'Release name (optional, defaults to archive-<timestamp>)'
+        required: false
+        type: string
+      release_tag:
+        description: 'Release tag (optional, defaults to archive-<timestamp>)'
+        required: false
+        type: string
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      # ============================================================
+      # プロセス1: jlumbroso/free-disk-spaceを利用して不要なファイルを削除
+      # ============================================================
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      # ============================================================
+      # プロセス2: 必要なパッケージインストール
+      # ============================================================
+      - name: Install required packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget curl zip unzip p7zip-full jq file
+
+      # ============================================================
+      # プロセス3: URLからファイルをダウンロード
+      # ============================================================
+      - name: Download from Internet Archive
+        id: download
+        run: |
+          mkdir -p download
+          cd download
+          
+          ARCHIVE_URL="${{ inputs.archive_url }}"
+          echo "Downloading from: $ARCHIVE_URL"
+          
+          # archive.org/details/xxx 形式の場合
+          if [[ "$ARCHIVE_URL" =~ archive.org/details/([^/\s]+) ]]; then
+            IDENTIFIER="${BASH_REMATCH[1]}"
+            echo "Archive identifier: $IDENTIFIER"
+            
+            # APIからファイルリストを取得
+            echo "Fetching file list from archive.org API..."
+            FILES=$(curl -s "https://archive.org/metadata/$IDENTIFIER/files" | \
+              jq -r '.result[] | select(.name | test("\.(zip|7z|tar|gz|tgz|rar|exe|dll|txt|pdf|jpg|jpeg|png|iso|bin|img|dat)$")) | .name' 2>/dev/null || true)
+            
+            if [ -n "$FILES" ]; then
+              echo "Downloading files..."
+              while IFS= read -r filename; do
+                if [ -n "$filename" ]; then
+                  echo "  Downloading: $filename"
+                  wget -q --tries=3 --timeout=30 "https://archive.org/download/$IDENTIFIER/$filename" || true
+                fi
+              done <<< "$FILES"
+            else
+              echo "No files found via API, trying wget"
+              wget -q -r -np -nH --cut-dirs=1 -R "index.html*" "$ARCHIVE_URL" || true
+            fi
+            
+          # 直接ファイルURLの場合
+          elif [[ "$ARCHIVE_URL" =~ \.zip$ || "$ARCHIVE_URL" =~ \.7z$ || "$ARCHIVE_URL" =~ \.tar$ || 
+                 "$ARCHIVE_URL" =~ \.gz$ || "$ARCHIVE_URL" =~ \.exe$ || "$ARCHIVE_URL" =~ \.iso$ ]]; then
+            echo "Direct file URL detected"
+            wget -q -O direct_download "$ARCHIVE_URL" || true
+            
+          # 一般的なURLの場合
+          else
+            echo "Downloading from general URL"
+            wget -q -r -np -nH --cut-dirs=1 -R "index.html*" "$ARCHIVE_URL" || true
+          fi
+          
+          # 圧縮ファイルを展開
+          echo "Extracting archives..."
+          find . -maxdepth 1 -type f \( -name "*.zip" -o -name "*.7z" -o -name "*.tar.gz" -o -name "*.tgz" -o -name "*.tar" -o -name "*.rar" \) | while read -r archive; do
+            echo "  Extracting: $archive"
+            dirname="${archive%.*}_extracted"
+            mkdir -p "$dirname"
+            
+            if [[ "$archive" == *.zip ]]; then
+              unzip -q "$archive" -d "$dirname"
+            elif [[ "$archive" == *.7z ]]; then
+              7z x "$archive" -o"$dirname" -y >/dev/null 2>&1
+            elif [[ "$archive" == *.rar ]]; then
+              unrar x "$archive" "$dirname" >/dev/null 2>&1 || true
+            elif [[ "$archive" == *.tar.gz || "$archive" == *.tgz ]]; then
+              tar xzf "$archive" -C "$dirname"
+            elif [[ "$archive" == *.tar ]]; then
+              tar xf "$archive" -C "$dirname"
+            fi
+            
+            rm -f "$archive"
+          done
+          
+          # 空のディレクトリを削除
+          find . -type d -empty -delete
+          
+          echo "Download completed"
+          echo "Files in download directory:"
+          find . -type f -exec ls -lh {} \;
+          
+          cd ..
+
+      # ============================================================
+      # プロセス4: フォルダのアップロードが出来ないので、
+      # フォルダが存在する場合は/でリネーム
+      # 例: games/i.txt, games/test.exe
+      # ============================================================
+      - name: Rename files with folder paths
+        id: rename
+        run: |
+          cd download
+          
+          # Find all files recursively and move them to root with path in name
+          find . -type f | while IFS= read -r filepath; do
+            # Get the relative path from current directory
+            relpath="${filepath#./}"
+            
+            # If file is already at root, skip
+            if [[ "$relpath" != *"/*" ]]; then
+              continue
+            fi
+            
+            # Replace / with / in the filename (keep the path structure in the name)
+            new_name="$relpath"
+            
+            # Move file to root with new name
+            mv "$filepath" "$new_name"
+            
+            # Remove the now-empty directory structure
+            dirpath="$(dirname "$filepath")"
+            while [ "$dirpath" != "." ] && [ -d "$dirpath" ] && [ -z "$(ls -A "$dirpath")" ]; do
+              rmdir "$dirpath"
+              dirpath="$(dirname "$dirpath")"
+            done
+          done
+          
+          echo "Files after renaming:"
+          find . -type f | sort
+          
+          cd ..
+
+      # ============================================================
+      # プロセス5: 1.9GiB以上のファイルはzipのpartで1.9GiBで分割
+      # ============================================================
+      - name: Split files larger than 1.9GB
+        id: split
+        run: |
+          cd download
+          
+          # 1.9GB in bytes
+          MAX_SIZE=$((1900 * 1024 * 1024))
+          SPLIT_SIZE="1900M"
+          
+          # Find files larger than 1.9GB
+          find . -type f -size +${MAX_SIZE}c | while IFS= read -r file; do
+            echo "Found large file: $file (size: $(du -h "$file" | cut -f1))"
+            
+            # Try zip split first
+            echo "  Attempting zip split..."
+            zip -s ${SPLIT_SIZE} -r "${file}.zip" "$file" 2>/dev/null
+            
+            if [ -f "${file}.z01" ]; then
+              echo "  Successfully split with zip"
+              rm -f "$file"
+              # Rename the split files to include the original name
+              for part in "${file}".z*; do
+                if [ -f "$part" ]; then
+                  mv "$part" "${file}.zip_${part##*.}"
+                fi
+              done
+            else
+              # Try 7z split
+              echo "  Attempting 7z split..."
+              7z a -v${SPLIT_SIZE} "${file}.7z" "$file" >/dev/null 2>&1
+              
+              if [ -f "${file}.7z.001" ]; then
+                echo "  Successfully split with 7z"
+                rm -f "$file"
+                # Rename 7z split files
+                for part in "${file}".7z.*; do
+                  if [ -f "$part" ]; then
+                    mv "$part" "${file}.7z_${part##*.}"
+                  fi
+                done
+              else
+                echo "  Could not split $file, keeping original"
+              fi
+            fi
+          done
+          
+          cd ..
+          
+          echo "Files after splitting:"
+          cd download
+          find . -type f -exec ls -lh {} \;
+          cd ..
+
+      # ============================================================
+      # プロセス6: アップロードするGitHub Releaseを作成
+      # ============================================================
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const releaseName = core.getInput('release_name') || 
+              'Archive Download ' + new Date().toISOString().replace(/[:.]/g, '-');
+            const releaseTag = core.getInput('release_tag') || 
+              'archive-' + Date.now();
+            
+            console.log('Creating release with tag:', releaseTag);
+            
+            const { data: release } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: releaseTag,
+              name: releaseName,
+              body: 'Automatically created from Internet Archive download',
+              draft: false,
+              prerelease: false
+            });
+            
+            core.setOutput('release_id', release.id);
+            core.setOutput('release_tag', releaseTag);
+            core.setOutput('upload_url', release.upload_url);
+            
+            return release;
+
+      # ============================================================
+      # プロセス7: GitHub Releaseにファイルをアップロード
+      # ============================================================
+      - name: Upload files to Release
+        id: upload
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd download
+          
+          RELEASE_TAG="${{ steps.create_release.outputs.release_tag }}"
+          REPO="${{ github.repository }}"
+          
+          echo "Uploading files to release: $RELEASE_TAG"
+          echo "Repository: $REPO"
+          
+          # Count files
+          FILE_COUNT=$(find . -type f | wc -l)
+          echo "Total files to upload: $FILE_COUNT"
+          
+          # Upload each file using GitHub CLI
+          find . -type f -print0 | while IFS= read -r -d '' file; do
+            FILENAME=$(basename "$file")
+            echo "Uploading: $FILENAME"
+            
+            # Retry up to 3 times
+            for i in 1 2 3; do
+              if gh release upload "$RELEASE_TAG" "$file" --repo "$REPO" --clobber; then
+                echo "  ✓ Successfully uploaded $FILENAME"
+                break
+              else
+                echo "  ✗ Attempt $i failed for $FILENAME"
+                if [ $i -eq 3 ]; then
+                  echo "  ✗ Failed to upload $FILENAME after 3 attempts"
+                fi
+                sleep 5
+              fi
+            done
+          done
+          
+          cd ..
+
+      # ============================================================
+      # プロセス8: Actionを終了
+      # ============================================================
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Cleaning up..."
+          rm -rf download
+          echo "✅ Workflow completed!"
