@@ -43,7 +43,7 @@ jobs:
       - name: Install required packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget curl zip unzip p7zip-full jq file
+          sudo apt-get install -y wget curl zip unzip p7zip-full jq file grep sed
 
       # ============================================================
       # プロセス3: URLからファイルをダウンロード
@@ -58,25 +58,27 @@ jobs:
           echo "Downloading from: $ARCHIVE_URL"
           
           # archive.org/details/xxx 形式の場合
-          if [[ "$ARCHIVE_URL" =~ archive.org/details/([^/\s]+) ]]; then
-            IDENTIFIER="${BASH_REMATCH[1]}"
+          if [[ "$ARCHIVE_URL" == *"archive.org/details/"* ]]; then
+            # Extract identifier more reliably using sed
+            IDENTIFIER=$(echo "$ARCHIVE_URL" | sed -n 's|.*archive.org/details/||p' | sed 's|/.*||' | sed 's|\?.*||')
             echo "Archive identifier: $IDENTIFIER"
             
             # APIからファイルリストを取得
             echo "Fetching file list from archive.org API..."
-            API_URL="https://archive.org/metadata/$IDENTIFIER/files"
+            API_URL="https://archive.org/metadata/${IDENTIFIER}/files"
             echo "API URL: $API_URL"
             
             # Try to get files from API with retry
             for i in 1 2 3; do
               API_RESPONSE=$(curl -s --retry 3 --retry-delay 5 "$API_URL" 2>/dev/null || true)
-              if [ -n "$API_RESPONSE" ] && [ "$API_RESPONSE" != "null" ]; then
+              if [ -n "$API_RESPONSE" ] && [ "$API_RESPONSE" != "null" ] && [ "$API_RESPONSE" != "" ]; then
                 break
               fi
               sleep 5
             done
             
             echo "API Response length: ${#API_RESPONSE}"
+            echo "API Response: $API_RESPONSE"
             
             # Extract file names from API response
             FILES=$(echo "$API_RESPONSE" | jq -r '.result[]? | select(.name != null) | .name' 2>/dev/null || true)
@@ -99,7 +101,7 @@ jobs:
                 fi
                 
                 echo "  Downloading: $filename"
-                wget -q --tries=3 --timeout=60 --continue "https://archive.org/download/$IDENTIFIER/$filename" || true
+                wget -q --tries=3 --timeout=60 --continue "https://archive.org/download/${IDENTIFIER}/${filename}" || true
                 
                 # Check if file was downloaded and is not HTML
                 if [ -f "$filename" ]; then
@@ -122,71 +124,17 @@ jobs:
               # If no files were downloaded successfully, try alternative approach
               if [ "$SUCCESS_COUNT" -eq 0 ]; then
                 echo "No files downloaded from API, trying to parse details page..."
-                
-                # Get the details page
-                HTML_CONTENT=$(curl -s "$ARCHIVE_URL" 2>/dev/null || true)
-                
-                # Extract download links from the page
-                echo "$HTML_CONTENT" | grep -oE 'https://archive\.org/download/[^"<>\s]+' | sort -u | while read -r download_url; do
-                  filename=$(basename "$download_url")
-                  
-                  # Skip HTML files
-                  if [[ "$filename" == *.html ]] || [[ "$filename" == *.htm ]]; then
-                    continue
-                  fi
-                  
-                  echo "  Found download link: $filename"
-                  wget -q --tries=3 --timeout=60 --continue "$download_url" || true
-                  
-                  # Check if file is valid
-                  if [ -f "$filename" ]; then
-                    FILE_SIZE=$(stat -c%s "$filename")
-                    if [ "$FILE_SIZE" -lt 10240 ]; then
-                      FILE_TYPE=$(file -b "$filename" | head -1)
-                      if [[ "$FILE_TYPE" == *"HTML"* ]] || [[ "$FILE_TYPE" == *"text"* ]]; then
-                        echo "  Removing small HTML/text file: $filename"
-                        rm -f "$filename"
-                      fi
-                    fi
-                  fi
-                done
+                self._download_from_page "$ARCHIVE_URL" "$IDENTIFIER"
               fi
             else
               echo "No files found via API, trying to parse details page..."
-              
-              # Get the details page
-              HTML_CONTENT=$(curl -s "$ARCHIVE_URL" 2>/dev/null || true)
-              
-              # Extract download links from the page
-              echo "$HTML_CONTENT" | grep -oE 'https://archive\.org/download/[^"<>\s]+' | sort -u | while read -r download_url; do
-                filename=$(basename "$download_url")
-                
-                # Skip HTML files
-                if [[ "$filename" == *.html ]] || [[ "$filename" == *.htm ]]; then
-                  continue
-                fi
-                
-                echo "  Found download link: $filename"
-                wget -q --tries=3 --timeout=60 --continue "$download_url" || true
-                
-                # Check if file is valid
-                if [ -f "$filename" ]; then
-                  FILE_SIZE=$(stat -c%s "$filename")
-                  if [ "$FILE_SIZE" -lt 10240 ]; then
-                    FILE_TYPE=$(file -b "$filename" | head -1)
-                    if [[ "$FILE_TYPE" == *"HTML"* ]] || [[ "$FILE_TYPE" == *"text"* ]]; then
-                      echo "  Removing small HTML/text file: $filename"
-                      rm -f "$filename"
-                    fi
-                  fi
-                fi
-              done
+              self._download_from_page "$ARCHIVE_URL" "$IDENTIFIER"
             fi
             
           # 直接ファイルURLの場合
-          elif [[ "$ARCHIVE_URL" =~ \.zip$ || "$ARCHIVE_URL" =~ \.7z$ || "$ARCHIVE_URL" =~ \.tar$ || 
-                 "$ARCHIVE_URL" =~ \.gz$ || "$ARCHIVE_URL" =~ \.tgz$ || "$ARCHIVE_URL" =~ \.rar$ ||
-                 "$ARCHIVE_URL" =~ \.exe$ || "$ARCHIVE_URL" =~ \.iso$ || "$ARCHIVE_URL" =~ \.bin$ ]]; then
+          elif [[ "$ARCHIVE_URL" == *\.zip* ]] || [[ "$ARCHIVE_URL" == *\.7z* ]] || [[ "$ARCHIVE_URL" == *\.tar* ]] || 
+               [[ "$ARCHIVE_URL" == *\.gz* ]] || [[ "$ARCHIVE_URL" == *\.tgz* ]] || [[ "$ARCHIVE_URL" == *\.rar* ]] ||
+               [[ "$ARCHIVE_URL" == *\.exe* ]] || [[ "$ARCHIVE_URL" == *\.iso* ]] || [[ "$ARCHIVE_URL" == *\.bin* ]]; then
             echo "Direct file URL detected"
             OUTPUT_FILENAME=$(basename "$ARCHIVE_URL")
             wget -q --tries=3 --timeout=60 --continue -O "$OUTPUT_FILENAME" "$ARCHIVE_URL" || true
@@ -207,13 +155,13 @@ jobs:
           else
             echo "Downloading from general URL"
             # Try to extract identifier from any archive.org URL
-            if [[ "$ARCHIVE_URL" =~ archive.org/ ]]; then
+            if [[ "$ARCHIVE_URL" == *"archive.org"* ]]; then
               # Try to get identifier from URL
-              IDENTIFIER=$(echo "$ARCHIVE_URL" | grep -oE 'details/[^/]+' | sed 's/details//' | head -1)
+              IDENTIFIER=$(echo "$ARCHIVE_URL" | grep -oE '[^/]+' | tail -1 | sed 's|\?.*||')
               if [ -n "$IDENTIFIER" ]; then
                 echo "Extracted identifier: $IDENTIFIER"
                 # Try API again
-                API_URL="https://archive.org/metadata/$IDENTIFIER/files"
+                API_URL="https://archive.org/metadata/${IDENTIFIER}/files"
                 API_RESPONSE=$(curl -s --retry 3 "$API_URL" 2>/dev/null || true)
                 FILES=$(echo "$API_RESPONSE" | jq -r '.result[]? | select(.name != null) | .name' 2>/dev/null || true)
                 if [ -n "$FILES" ]; then
@@ -221,12 +169,77 @@ jobs:
                     if [ -z "$filename" ]; then continue; fi
                     if [[ "$filename" == *.html ]] || [[ "$filename" == *.htm ]]; then continue; fi
                     echo "  Downloading: $filename"
-                    wget -q --tries=3 --timeout=60 --continue "https://archive.org/download/$IDENTIFIER/$filename" || true
+                    wget -q --tries=3 --timeout=60 --continue "https://archive.org/download/${IDENTIFIER}/${filename}" || true
                   done <<< "$FILES"
                 fi
               fi
             fi
           fi
+          
+          # Helper function to download from page
+          _download_from_page() {
+            local url="$1"
+            local identifier="$2"
+            
+            echo "  Parsing page: $url"
+            
+            # Get the details page
+            HTML_CONTENT=$(curl -s "$url" 2>/dev/null || true)
+            
+            # Extract download links - look for /download/identifier/filename pattern
+            # Use a more robust grep pattern
+            echo "$HTML_CONTENT" | grep -oE 'https://archive\.org/download/'${identifier}'/[^"<>\s\?]+' | sort -u | while read -r download_url; do
+              filename=$(basename "$download_url")
+              
+              # Skip HTML files
+              if [[ "$filename" == *.html ]] || [[ "$filename" == *.htm ]]; then
+                continue
+              fi
+              
+              echo "  Found download link: $download_url"
+              echo "  Filename: $filename"
+              wget -q --tries=3 --timeout=60 --continue "$download_url" || true
+              
+              # Check if file is valid
+              if [ -f "$filename" ]; then
+                FILE_SIZE=$(stat -c%s "$filename")
+                if [ "$FILE_SIZE" -lt 10240 ]; then
+                  FILE_TYPE=$(file -b "$filename" | head -1)
+                  if [[ "$FILE_TYPE" == *"HTML"* ]] || [[ "$FILE_TYPE" == *"text"* ]]; then
+                    echo "  Removing small HTML/text file: $filename"
+                    rm -f "$filename"
+                  fi
+                fi
+              fi
+            done
+            
+            # If still no files, try a broader search
+            if [ ! "$(ls -A . 2>/dev/null)" ]; then
+              echo "  Trying broader search for download links..."
+              echo "$HTML_CONTENT" | grep -oE 'https://archive\.org/download/[^"<>\s\?]+' | sort -u | while read -r download_url; do
+                filename=$(basename "$download_url")
+                
+                if [[ "$filename" == *.html ]] || [[ "$filename" == *.htm ]]; then
+                  continue
+                fi
+                
+                echo "  Found download link (broad): $download_url"
+                echo "  Filename: $filename"
+                wget -q --tries=3 --timeout=60 --continue "$download_url" || true
+                
+                if [ -f "$filename" ]; then
+                  FILE_SIZE=$(stat -c%s "$filename")
+                  if [ "$FILE_SIZE" -lt 10240 ]; then
+                    FILE_TYPE=$(file -b "$filename" | head -1)
+                    if [[ "$FILE_TYPE" == *"HTML"* ]] || [[ "$FILE_TYPE" == *"text"* ]]; then
+                      echo "  Removing small HTML/text file: $filename"
+                      rm -f "$filename"
+                    fi
+                  fi
+                fi
+              done
+            fi
+          }
           
           # 圧縮ファイルを展開
           echo "Extracting archives..."
